@@ -37,13 +37,18 @@ FLYER_API_KEY = os.getenv("FLYER_API_KEY", "").strip()
 TGRASSA_API_BASE = os.getenv("TGRASSA_API_BASE", "https://tgrass.space").strip().rstrip("/")
 TGRASSA_API_SSL_VERIFY = os.getenv("TGRASSA_API_SSL_VERIFY", "false").strip().lower() in ("1", "true", "yes")
 
+# Webhook Tgrass: при отписке Tgrass шлёт POST на ваш URL. Порт 0 = отключить приём webhook.
+TGRASSA_WEBHOOK_PORT = int(os.getenv("TGRASSA_WEBHOOK_PORT", "0"))
+TGRASSA_WEBHOOK_PATH = os.getenv("TGRASSA_WEBHOOK_PATH", "/webhook/tgrass").strip().rstrip("/") or "/webhook/tgrass"
+
 # Проверка SSL при запросах к Flyer API (false — отключить, если ошибка сертификата на macOS)
 FLYER_API_SSL_VERIFY = os.getenv("FLYER_API_SSL_VERIFY", "true").strip().lower() in ("1", "true", "yes")
 
 # Доля от награды задания, которую получает пользователь (остальное — маржа бота). 0.0–1.0.
 # Например 0.70: с задания 1$ пользователь получает 0.70$, бот оставляет 0.30$.
 TGRASSA_PAYOUT_RATE = float(os.getenv("TGRASSA_PAYOUT_RATE", "0.70"))
-FLYER_PAYOUT_RATE = float(os.getenv("FLYER_PAYOUT_RATE", "0.70"))
+# Фиксированная выплата за одно Fly-задание в долларах (не зависит от цены в API).
+FLYER_PAYOUT_PER_TASK = float(os.getenv("FLYER_PAYOUT_PER_TASK", "0.010"))
 
 
 def get_tgrassa_link() -> str:

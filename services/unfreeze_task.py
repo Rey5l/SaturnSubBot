@@ -12,6 +12,12 @@ logger = logging.getLogger(__name__)
 CHECK_INTERVAL_SEC = 60
 
 
+def _fly_task_complete(data: dict) -> bool:
+    """Успешное выполнение задания Fly по ответу API (как в handlers.platforms)."""
+    result = (data.get("result") or data.get("status") or "").lower().strip()
+    return result in ("complete", "completed", "done", "success", "ok")
+
+
 async def _process_due(bot) -> None:
     """Обработать все записи, у которых наступило время разморозки."""
     due = await frozen_get_due()
@@ -55,7 +61,7 @@ async def _process_due(bot) -> None:
                     user_id=user_id,
                     signature=signature,
                 )
-                if data.get("result") == "complete":
+                if _fly_task_complete(data):
                     result = await frozen_release_and_credit(row_id)
                     if result:
                         _, credited = result

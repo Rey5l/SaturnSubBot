@@ -6,7 +6,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import config
-from database import add_balance, get_balance, add_channel_task, get_channel_tasks
+from database import (
+    add_balance,
+    get_balance,
+    add_channel_task,
+    get_channel_tasks,
+    get_mandatory_channels,
+    add_mandatory_channel,
+    remove_mandatory_channel,
+)
 
 router = Router(name="admin")
 
@@ -25,6 +33,12 @@ class AddChannelStates(StatesGroup):
     waiting_channel = State()
     waiting_reward = State()
     waiting_title = State()
+
+
+class AddMandatoryStates(StatesGroup):
+    waiting_username = State()
+    waiting_title = State()
+    waiting_invite = State()
 
 
 @router.message(Command("addbalance"))
@@ -176,6 +190,98 @@ async def add_channel_title(message: Message, state: FSMContext) -> None:
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
+
+
+# --- Обязательные подписки (доступ к боту) ---
+
+@router.message(Command("addmandatory"))
+async def cmd_add_mandatory(message: Message, state: FSMContext) -> None:
+    """Добавить обязательный канал. Только админ."""
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    await state.set_state(AddMandatoryStates.waiting_username)
+    await message.answer(
+        "Введите username канала (например @channelname или channelname).\n"
+        "Бот должен быть добавлен в канал (админ с правом «просмотр участников» или участник)."
+    )
+
+
+@router.message(AddMandatoryStates.waiting_username, F.text)
+async def mandatory_username(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    username = message.text.strip().lstrip("@").strip()
+    if not username or " " in username:
+        await message.answer("Введите один username без пробелов.")
+        return
+    await state.update_data(channel_username=username)
+    await state.set_state(AddMandatoryStates.waiting_title)
+    await message.answer("Введите название канала для кнопки (или /skip):")
+
+
+@router.message(AddMandatoryStates.waiting_title, F.text)
+async def mandatory_title(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    title = message.text.strip() if message.text and message.text.strip() != "/skip" else ""
+    await state.update_data(title=title)
+    await state.set_state(AddMandatoryStates.waiting_invite)
+    await message.answer("Введите ссылку-приглашение (t.me/... или t.me/joinchat/...), или /skip:")
+
+
+@router.message(AddMandatoryStates.waiting_invite, F.text)
+async def mandatory_invite(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    invite = message.text.strip() if message.text and message.text.strip() != "/skip" else ""
+    data = await state.get_data()
+    await state.clear()
+    try:
+        ch_id = await add_mandatory_channel(
+            channel_username=data["channel_username"],
+            title=data.get("title", ""),
+            invite_link=invite,
+        )
+        await message.answer(
+            f"✅ Обязательный канал добавлен (id={ch_id}).\n"
+            f"@{data['channel_username']} — пользователи должны подписаться для доступа к боту."
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+@router.message(Command("mandatory"))
+async def cmd_list_mandatory(message: Message) -> None:
+    """Список обязательных каналов. Только админ."""
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    channels = await get_mandatory_channels()
+    if not channels:
+        await message.answer("Обязательных каналов нет. Добавьте: /addmandatory")
+        return
+    lines = ["🔒 *Обязательные подписки:*"]
+    kb = []
+    for ch in channels:
+        title = ch.get("title") or ch.get("channel_username") or "Канал"
+        lines.append(f"• {ch['id']}: {title} ({ch['channel_username']})")
+        kb.append([InlineKeyboardButton(text=f"🗑 Удалить {ch['id']}", callback_data=f"delmandatory:{ch['id']}")])
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer("Удалить канал:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@router.callback_query(F.data.startswith("delmandatory:"))
+async def del_mandatory_callback(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id if callback.from_user else 0):
+        await callback.answer()
+        return
+    try:
+        ch_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка")
+        return
+    await remove_mandatory_channel(ch_id)
+    await callback.answer("Канал удалён из обязательных.")
+    await callback.message.edit_text("✅ Канал удалён из обязательных. Обновите список: /mandatory")
 
 
 @router.message(Command("channels"))

@@ -12,7 +12,9 @@ from aiogram.enums import ParseMode
 import config
 from database import init_db
 from handlers import menu, platforms, balance, withdraw, admin, referral, info
+from middlewares.mandatory_subscription import MandatorySubscriptionMiddleware
 from services.crypto_pay import close_client
+from services.tgrass_webhook import run_webhook_server
 from services.unfreeze_task import run_unfreeze_loop
 
 logging.basicConfig(
@@ -23,16 +25,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_tgrass_webhook_runner = None
+
+
 async def on_startup(bot: Bot = None) -> None:
     """Инициализация при запуске."""
+    global _tgrass_webhook_runner
     await init_db()
     logger.info("База данных инициализирована")
     if bot is not None:
         asyncio.create_task(run_unfreeze_loop(bot))
+    if config.TGRASSA_WEBHOOK_PORT > 0:
+        _tgrass_webhook_runner = await run_webhook_server(config.TGRASSA_WEBHOOK_PORT)
 
 
 async def on_shutdown() -> None:
     """Очистка при остановке."""
+    global _tgrass_webhook_runner
+    if _tgrass_webhook_runner is not None:
+        await _tgrass_webhook_runner.cleanup()
+        _tgrass_webhook_runner = None
     await close_client()
     logger.info("Бот остановлен")
 
@@ -56,6 +68,9 @@ def main() -> None:
             logger.info("BOT_USERNAME установлен из API: %s", config.BOT_USERNAME)
     dp.startup.register(_startup)
     dp.shutdown.register(on_shutdown)
+
+    dp.message.middleware(MandatorySubscriptionMiddleware())
+    dp.callback_query.middleware(MandatorySubscriptionMiddleware())
 
     dp.include_router(menu.router)
     dp.include_router(platforms.router)

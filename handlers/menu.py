@@ -110,3 +110,35 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=None,
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "mandatory_check")
+async def mandatory_check_callback(callback: CallbackQuery) -> None:
+    """Проверка подписки на обязательные каналы по нажатию «Проверить подписку»."""
+    from database import get_mandatory_channels, get_or_create_user
+    from services.mandatory_subscription import check_mandatory_subscription, build_subscription_keyboard, SUBSCRIPTION_MESSAGE
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    username = callback.from_user.username if callback.from_user else None
+    channels = await get_mandatory_channels()
+    if not channels:
+        await callback.message.edit_text("Доступ открыт. Выберите действие в меню ниже.", reply_markup=None)
+        await callback.answer("✅ Доступ открыт!")
+        return
+    ok, not_subbed = await check_mandatory_subscription(callback.bot, user_id)
+    if ok:
+        await get_or_create_user(user_id, username)
+        await callback.message.edit_text("✅ Доступ открыт!", reply_markup=None)
+        await callback.answer("✅ Подписка проверена!")
+        await callback.message.answer(
+            WELCOME_TEXT,
+            reply_markup=main_reply_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+    keyboard = build_subscription_keyboard(not_subbed)
+    try:
+        await callback.message.edit_text(SUBSCRIPTION_MESSAGE, reply_markup=keyboard, parse_mode="Markdown")
+    except Exception:
+        await callback.message.answer(SUBSCRIPTION_MESSAGE, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer("Подпишитесь на все каналы выше и нажмите «Проверить подписку» снова.")

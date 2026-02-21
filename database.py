@@ -173,6 +173,24 @@ async def init_db() -> None:
                     )
                 """)
                 await db.commit()
+    # Миграция: mandatory_channels (обязательные подписки для доступа к боту)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mandatory_channels'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                await db.execute("""
+                    CREATE TABLE mandatory_channels (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        channel_username TEXT NOT NULL,
+                        channel_id TEXT,
+                        title TEXT,
+                        invite_link TEXT,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                await db.commit()
     # Миграция: frozen_funds (замороженные средства на 24 ч)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -187,6 +205,22 @@ async def init_db() -> None:
                         unfreeze_at TEXT NOT NULL,
                         platform TEXT NOT NULL,
                         signature TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                await db.commit()
+    # Миграция: grs_webhook_events (события отписки от Tgrass webhook)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='grs_webhook_events'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                await db.execute("""
+                    CREATE TABLE grs_webhook_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tg_user_id INTEGER NOT NULL,
+                        offer_link TEXT NOT NULL,
+                        status TEXT NOT NULL,
                         created_at TEXT NOT NULL DEFAULT (datetime('now'))
                     )
                 """)
@@ -523,6 +557,19 @@ async def flyer_mark_completed_and_freeze(user_id: int, signature: str, payout: 
         await db.commit()
 
 
+async def flyer_clear_pending_for_completed(user_id: int) -> None:
+    """Удалить из pending все задания, которые уже есть в completed (очистка после успешной проверки)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """DELETE FROM flyer_pending_tasks
+               WHERE user_id = ? AND signature IN (
+                   SELECT signature FROM flyer_completed_tasks WHERE user_id = ?
+               )""",
+            (user_id, user_id),
+        )
+        await db.commit()
+
+
 # --- Tgrassa API: pending/completed по signature ---
 
 async def tgrassa_save_pending(user_id: int, signature: str, price: float) -> int:
@@ -614,6 +661,16 @@ async def grs_clear_pending_credit(user_id: int) -> None:
         await db.commit()
 
 
+async def grs_save_webhook_event(tg_user_id: int, offer_link: str, status: str) -> None:
+    """Сохранить событие от Tgrass webhook (отписка и т.д.)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO grs_webhook_events (tg_user_id, offer_link, status) VALUES (?, ?, ?)""",
+            (tg_user_id, offer_link, status),
+        )
+        await db.commit()
+
+
 # --- Замороженные средства (24 ч), разморозка с проверкой подписки ---
 
 async def frozen_add(user_id: int, amount: float, unfreeze_at: str, platform: str, signature: str | None = None) -> None:
@@ -693,3 +750,46 @@ async def frozen_delete(row_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM frozen_funds WHERE id = ?", (row_id,))
         await db.commit()
+
+
+# --- Обязательные подписки (доступ к боту только после подписки) ---
+
+async def get_mandatory_channels() -> list[dict]:
+    """Список обязательных каналов, отсортированный по sort_order."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, channel_username, channel_id, title, invite_link FROM mandatory_channels ORDER BY sort_order, id"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def add_mandatory_channel(channel_username: str, title: str = "", invite_link: str = "", channel_id: str = "") -> int:
+    """Добавить обязательный канал. channel_username: @name или name. Возвращает id."""
+    channel_username = (channel_username or "").strip()
+    if not channel_username:
+        raise ValueError("channel_username не задан")
+    if not channel_username.startswith("@"):
+        channel_username = "@" + channel_username
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM mandatory_channels") as cur:
+            row = await cur.fetchone()
+        sort = row[0] if row else 1
+        await db.execute(
+            """INSERT INTO mandatory_channels (channel_username, channel_id, title, invite_link, sort_order, created_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (channel_username, (channel_id or "").strip(), (title or "").strip(), (invite_link or "").strip(), sort),
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cur:
+            row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def remove_mandatory_channel(channel_id: int) -> bool:
+    """Удалить обязательный канал по id. Возвращает True если удалён."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM mandatory_channels WHERE id = ?", (channel_id,))
+        await db.commit()
+        return True

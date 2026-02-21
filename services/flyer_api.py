@@ -29,8 +29,10 @@ async def get_me(key: str) -> dict:
 
 async def flyer_check(key: str, user_id: int, language_code: str | None = None) -> dict:
     """
-    Проверка обязательной подписки. POST /check.
-    Если в ответе "skip": true — проверка для пользователя не обязательна (всё выполнено или сервис отключён).
+    Проверка подписок Flyer. Используется метод /check.
+    POST https://api.flyerservice.io/check.
+    Body: {"key", "user_id", "language_code"}.
+    Ответ: skip=true → подписки проверены, доступ открыт; skip=false → показать задачи из /get_tasks.
     """
     payload: dict = {"key": key, "user_id": user_id}
     if language_code:
@@ -45,8 +47,8 @@ async def get_tasks(
     language_code: str | None = None,
 ) -> dict:
     """
-    Получить задания для пользователя. POST /get_tasks.
-    Возвращает: { "result": [...], "attached_at": ..., "error": ... }
+    Получить задания. POST https://api.flyerservice.io/get_tasks.
+    Body: {"key", "user_id", "language_code", "limit"}. Подписи заданий активны 48 ч.
     """
     payload: dict = {"key": key, "user_id": user_id, "limit": limit}
     if language_code:
@@ -55,7 +57,11 @@ async def get_tasks(
 
 
 async def check_task(key: str, user_id: int, signature: str) -> dict:
-    """Проверить статус задания. POST /check_task (user_id требуется по доке Flyer)."""
+    """
+    Проверить статус задания. POST /check_task.
+    Ответ: {"result": "string", "error": "string"}.
+    result: waiting — подписан, проверка через 24 ч; abort — отписался; complete — прошло 24 ч, подписан, оплата; incomplete — ещё не подписан.
+    """
     return await _post("/check_task", {"key": key, "user_id": user_id, "signature": signature})
 
 
