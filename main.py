@@ -14,7 +14,7 @@ from database import init_db
 from handlers import menu, platforms, balance, withdraw, admin, referral, info
 from middlewares.mandatory_subscription import MandatorySubscriptionMiddleware
 from services.crypto_pay import close_client
-from services.tgrass_webhook import run_webhook_server
+from services.webhooks import run_webhook_server
 from services.unfreeze_task import run_unfreeze_loop
 
 logging.basicConfig(
@@ -34,9 +34,12 @@ async def on_startup(bot: Bot = None) -> None:
     await init_db()
     logger.info("База данных инициализирована")
     if bot is not None:
+        # Удаляем вебхук, если он был установлен ранее (для работы polling)
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Вебхук Telegram удалён (polling запущен)")
         asyncio.create_task(run_unfreeze_loop(bot))
     if config.TGRASSA_WEBHOOK_PORT > 0:
-        _tgrass_webhook_runner = await run_webhook_server(config.TGRASSA_WEBHOOK_PORT)
+        _tgrass_webhook_runner = await run_webhook_server(config.TGRASSA_WEBHOOK_PORT, bot)
 
 
 async def on_shutdown() -> None:

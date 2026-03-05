@@ -5,7 +5,7 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKe
 from database import (
     stats_total_users,
     stats_users_today,
-    stats_tasks_completed,
+    stats_tasks_completed_today,
     stats_tasks_completed_channels,
     stats_withdrawn_total,
     stats_withdrawn_today,
@@ -22,7 +22,8 @@ def back_button() -> list:
 async def _info_text() -> str:
     total_users = await stats_total_users()
     users_today = await stats_users_today()
-    tasks_done = await stats_tasks_completed() + await stats_tasks_completed_channels()
+    tasks_done = await stats_tasks_completed_channels()
+    tasks_today = await stats_tasks_completed_today()
     withdrawn_total = await stats_withdrawn_total()
     withdrawn_today = await stats_withdrawn_today()
     return (
@@ -32,6 +33,7 @@ async def _info_text() -> str:
         f"╰• За сегодня: *{users_today}*\n"
         "────────────────\n"
         f"📝 Выполнено заданий: *{tasks_done}*\n"
+        f"╰• За сегодня: *{tasks_today}*\n"
         "────────────────\n"
         f"💸 Выведено всего: *{withdrawn_total:.2f}* USD\n"
         f"╰• За сегодня: *{withdrawn_today:.2f}* USD\n"

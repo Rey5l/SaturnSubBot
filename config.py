@@ -41,6 +41,9 @@ TGRASSA_API_SSL_VERIFY = os.getenv("TGRASSA_API_SSL_VERIFY", "false").strip().lo
 TGRASSA_WEBHOOK_PORT = int(os.getenv("TGRASSA_WEBHOOK_PORT", "0"))
 TGRASSA_WEBHOOK_PATH = os.getenv("TGRASSA_WEBHOOK_PATH", "/webhook/tgrass").strip().rstrip("/") or "/webhook/tgrass"
 
+# Webhook Flyer: при отписке Flyer шлёт POST на ваш URL.
+FLYER_WEBHOOK_PATH = os.getenv("FLYER_WEBHOOK_PATH", "/webhook/flyer").strip().rstrip("/") or "/webhook/flyer"
+
 # Проверка SSL при запросах к Flyer API (false — отключить, если ошибка сертификата на macOS)
 FLYER_API_SSL_VERIFY = os.getenv("FLYER_API_SSL_VERIFY", "true").strip().lower() in ("1", "true", "yes")
 

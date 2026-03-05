@@ -121,7 +121,8 @@ async def init_db() -> None:
                         user_id INTEGER NOT NULL,
                         signature TEXT NOT NULL,
                         price REAL NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(user_id, signature)
                     )
                 """)
                 await db.execute("""
@@ -146,7 +147,8 @@ async def init_db() -> None:
                         user_id INTEGER NOT NULL,
                         signature TEXT NOT NULL,
                         price REAL NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(user_id, signature)
                     )
                 """)
                 await db.execute("""
@@ -159,6 +161,13 @@ async def init_db() -> None:
                     )
                 """)
                 await db.commit()
+            else:
+                # Добавляем UNIQUE если его нет (для старых баз)
+                try:
+                    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tgrassa_pending_user_sig ON tgrassa_pending_tasks(user_id, signature)")
+                    await db.commit()
+                except Exception:
+                    pass
     # Миграция: grs_pending_credit (сумма к начислению за Grs при следующей успешной проверке)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -357,14 +366,26 @@ async def stats_users_today() -> int:
     return row[0] if row else 0
 
 
-async def stats_tasks_completed() -> int:
-    """Выполнено заданий (считаем как количество успешных выводов)."""
+async def stats_withdrawals_count() -> int:
+    """Количество успешных выводов."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM withdrawals WHERE status = 'completed'"
         ) as cur:
             row = await cur.fetchone()
     return row[0] if row else 0
+
+
+async def stats_tasks_completed_today() -> int:
+    """Количество выполненных заданий за сегодня (каналы + Flyer + Tgrassa)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM user_completed_tasks WHERE date(completed_at) = date('now')") as cur:
+            r1 = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM flyer_completed_tasks WHERE date(completed_at) = date('now')") as cur:
+            r2 = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM tgrassa_completed_tasks WHERE date(completed_at) = date('now')") as cur:
+            r3 = (await cur.fetchone())[0]
+    return (r1 or 0) + (r2 or 0) + (r3 or 0)
 
 
 async def stats_withdrawn_total() -> float:
@@ -479,10 +500,10 @@ async def stats_tasks_completed_channels() -> int:
 # --- Flyer API: pending/completed по signature ---
 
 async def flyer_save_pending(user_id: int, signature: str, price: float) -> int:
-    """Сохранить задание Flyer для пользователя (перед показом). Возвращает id."""
+    """Сохранить задание Flyer для пользователя (перед показом). Использует REPLACE для предотвращения дублей."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO flyer_pending_tasks (user_id, signature, price)
+            """INSERT OR REPLACE INTO flyer_pending_tasks (user_id, signature, price)
                VALUES (?, ?, ?)""",
             (user_id, signature, price),
         )
@@ -573,10 +594,10 @@ async def flyer_clear_pending_for_completed(user_id: int) -> None:
 # --- Tgrassa API: pending/completed по signature ---
 
 async def tgrassa_save_pending(user_id: int, signature: str, price: float) -> int:
-    """Сохранить задание Tgrassa для пользователя. Возвращает id."""
+    """Сохранить задание Tgrassa для пользователя. Использует REPLACE для предотвращения дублей."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO tgrassa_pending_tasks (user_id, signature, price)
+            """INSERT OR REPLACE INTO tgrassa_pending_tasks (user_id, signature, price)
                VALUES (?, ?, ?)""",
             (user_id, signature, price),
         )
@@ -595,6 +616,17 @@ async def tgrassa_get_pending_by_id(pending_id: int) -> dict | None:
         ) as cur:
             row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def tgrassa_get_pending_by_user(user_id: int) -> list[dict]:
+    """Все pending-задания Tgrassa для пользователя (для массовой проверки)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tgrassa_pending_tasks WHERE user_id = ?", (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def tgrassa_already_completed(user_id: int, signature: str) -> bool:
@@ -620,6 +652,36 @@ async def tgrassa_mark_completed_and_credit(user_id: int, signature: str, price:
             (price, user_id),
         )
         await db.execute("DELETE FROM tgrassa_pending_tasks WHERE user_id = ? AND signature = ?", (user_id, signature))
+        await db.commit()
+
+
+async def tgrassa_mark_completed_and_freeze(user_id: int, signature: str, payout: float, unfreeze_at: str) -> None:
+    """Отметить задание Tgrassa выполненным и заморозить выплату до unfreeze_at; удалить из pending."""
+    await get_or_create_user(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO tgrassa_completed_tasks (user_id, signature, price) VALUES (?, ?, ?)",
+            (user_id, signature, payout),
+        )
+        await db.execute(
+            """INSERT INTO frozen_funds (user_id, amount, unfreeze_at, platform, signature, created_at)
+               VALUES (?, ?, ?, 'grs', ?, datetime('now'))""",
+            (user_id, payout, unfreeze_at, signature),
+        )
+        await db.execute("DELETE FROM tgrassa_pending_tasks WHERE user_id = ? AND signature = ?", (user_id, signature))
+        await db.commit()
+
+
+async def tgrassa_clear_pending_for_completed(user_id: int) -> None:
+    """Удалить из pending все задания Tgrassa, которые уже есть в completed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """DELETE FROM tgrassa_pending_tasks
+               WHERE user_id = ? AND signature IN (
+                   SELECT signature FROM tgrassa_completed_tasks WHERE user_id = ?
+               )""",
+            (user_id, user_id),
+        )
         await db.commit()
 
 
@@ -700,12 +762,10 @@ async def frozen_get_total(user_id: int) -> float:
 
 async def frozen_get_summary(user_id: int) -> tuple[float, str | None]:
     """(сумма замороженного, ближайшая дата разморозки или None)."""
-    from datetime import datetime
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT SUM(amount), MIN(unfreeze_at) FROM frozen_funds WHERE user_id = ? AND unfreeze_at > ?",
-            (user_id, now),
+            "SELECT SUM(amount), MIN(unfreeze_at) FROM frozen_funds WHERE user_id = ?",
+            (user_id,),
         ) as cur:
             row = await cur.fetchone()
     total = float(row[0]) if row and row[0] is not None else 0.0
@@ -750,6 +810,143 @@ async def frozen_delete(row_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM frozen_funds WHERE id = ?", (row_id,))
         await db.commit()
+
+
+async def flyer_cancel_frozen_by_signature(user_id: int, signature: str) -> float:
+    """Найти и удалить замороженные средства по signature. Возвращает отменённую сумму."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, amount FROM frozen_funds WHERE user_id = ? AND signature = ? AND platform = 'flyer'",
+            (user_id, signature),
+        ) as cur:
+            rows = await cur.fetchall()
+        
+        logger.info("Flyer cancel: user_id=%s signature=%s found_rows=%s", user_id, signature, len(rows))
+
+        total_cancelled = 0.0
+        for row_id, amount in rows:
+            total_cancelled += float(amount)
+            async with aiosqlite.connect(DB_PATH) as db_del:
+                await db_del.execute("DELETE FROM frozen_funds WHERE id = ?", (row_id,))
+                await db_del.commit()
+        
+        # Также удаляем из выполненных заданий, чтобы пользователь не видел его как завершённое
+        async with aiosqlite.connect(DB_PATH) as db_del_comp:
+            await db_del_comp.execute(
+                "DELETE FROM flyer_completed_tasks WHERE user_id = ? AND signature = ?",
+                (user_id, signature)
+            )
+            await db_del_comp.commit()
+            
+    return total_cancelled
+
+
+async def grs_cancel_frozen_by_signature(user_id: int, signature: str) -> float:
+    """Найти и удалить замороженные средства Tgrass по signature (ссылке). Возвращает отменённую сумму."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, amount FROM frozen_funds WHERE user_id = ? AND signature = ? AND platform = 'grs'",
+            (user_id, signature),
+        ) as cur:
+            rows = await cur.fetchall()
+        
+        logger.info("Grs cancel: user_id=%s signature=%s found_rows=%s", user_id, signature, len(rows))
+
+        total_cancelled = 0.0
+        for row_id, amount in rows:
+            total_cancelled += float(amount)
+            async with aiosqlite.connect(DB_PATH) as db_del:
+                await db_del.execute("DELETE FROM frozen_funds WHERE id = ?", (row_id,))
+                await db_del.commit()
+        
+        # Также удаляем из выполненных заданий
+        async with aiosqlite.connect(DB_PATH) as db_del_comp:
+            await db_del_comp.execute(
+                "DELETE FROM tgrassa_completed_tasks WHERE user_id = ? AND signature = ?",
+                (user_id, signature)
+            )
+            await db_del_comp.commit()
+            
+    return total_cancelled
+
+
+async def grs_cancel_frozen_by_user(user_id: int) -> float:
+    """Найти и удалить все замороженные средства пользователя для платформы 'grs'."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, amount FROM frozen_funds WHERE user_id = ? AND platform = 'grs'",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        total_cancelled = 0.0
+        for row_id, amount in rows:
+            total_cancelled += float(amount)
+            async with aiosqlite.connect(DB_PATH) as db_del:
+                await db_del.execute("DELETE FROM frozen_funds WHERE id = ?", (row_id,))
+                await db_del.commit()
+        
+        # Также удаляем из выполненных (для tgrass это сложнее, так как нет прямой связи по signature, 
+        # но мы можем удалить все grs задания пользователя если он отписался от одного из них, 
+        # или просто оставить как есть если мы не знаем какой именно оффер.
+        # В воркере логика была просто по балансу.
+    return total_cancelled
+
+
+async def grs_mark_completed(user_id: int, offer_link: str) -> None:
+    """Отметить оффер Tgrass как выполненный (сохраняем ссылку для проверки)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO tgrassa_completed_tasks (user_id, signature, price) VALUES (?, ?, ?)",
+            (user_id, offer_link, 0.0), # price 0.0 так как начисление идет отдельно через заморозку
+        )
+        await db.commit()
+
+
+async def grs_is_completed(user_id: int, offer_link: str) -> bool:
+    """Проверить, выполнял ли уже пользователь этот оффер Tgrass."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM tgrassa_completed_tasks WHERE user_id = ? AND signature = ?",
+            (user_id, offer_link),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+
+async def grs_remove_completed_by_link(user_id: int, offer_link: str) -> bool:
+    """Удалить выполненное задание Tgrass по ссылке при отписке."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM tgrassa_completed_tasks WHERE user_id = ? AND signature = ?",
+            (user_id, offer_link)
+        )
+        await db.commit()
+        return True
+
+
+async def deduct_balance_up_to(user_id: int, amount: float) -> float:
+    """Списать amount (или сколько есть, если меньше). Возвращает реально списанную сумму."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    current = await get_balance(user_id)
+    to_deduct = min(current, amount)
+    logger.info("Deduct balance: user_id=%s current=%s amount=%s to_deduct=%s", user_id, current, amount, to_deduct)
+    if to_deduct <= 0:
+        return 0.0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+            (to_deduct, user_id),
+        )
+        await db.commit()
+    return to_deduct
 
 
 # --- Обязательные подписки (доступ к боту только после подписки) ---

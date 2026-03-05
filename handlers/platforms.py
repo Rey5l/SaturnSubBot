@@ -2,7 +2,7 @@
 import random
 from datetime import datetime, timedelta
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
@@ -15,9 +15,16 @@ from database import (
     flyer_already_completed,
     flyer_mark_completed_and_freeze,
     flyer_clear_pending_for_completed,
+    tgrassa_save_pending,
+    tgrassa_get_pending_by_user,
+    tgrassa_already_completed,
+    tgrassa_mark_completed_and_freeze,
+    tgrassa_clear_pending_for_completed,
     grs_set_pending_credit,
     grs_take_pending_amount,
     grs_clear_pending_credit,
+    grs_mark_completed,
+    grs_is_completed,
     frozen_add,
     frozen_get_summary,
 )
@@ -118,7 +125,7 @@ def _user_premium(user) -> bool:
 GRS_TASKS_MIN, GRS_TASKS_MAX = 2, 5  # случайное количество заданий Grs на подписку (2–5)
 
 async def _build_tgrassa_content(
-    user_id: int, username: str, user, data: dict | None = None, randomize: bool = True
+    user_id: int, username: str, user, bot: Bot | None = None, data: dict | None = None, randomize: bool = True
 ) -> tuple[str, list]:
     """Собирает текст и инлайн-кнопки для блока Grs задания. data — уже полученный ответ API (если есть)."""
     if not config.TGRASSA_API_KEY:
@@ -161,16 +168,38 @@ async def _build_tgrassa_content(
             rows = [[InlineKeyboardButton(text="🔄 Обновить", callback_data="platform:tgrassa")]]
             return text, rows
 
-    # Случайное количество каналов на подписку: от 2 до 5 (или меньше, если офферов меньше)
-    if randomize:
-        available = len(offers_raw)
-        cap = min(GRS_TASKS_MAX, available)
-        show_count = random.randint(GRS_TASKS_MIN, cap) if cap >= GRS_TASKS_MIN else cap
-        offers = offers_raw[:show_count]
-    else:
-        # При повторной отрисовке после нажатия «Проверить подписку» показываем тот же список,
-        # который пришёл от сервиса, без дополнительной рандомизации.
-        offers = offers_raw
+    # Показываем только те офферы, которые пользователь еще не выполнил
+    offers = []
+    
+    for o in offers_raw:
+        link = o.get("link") or o.get("url") or ""
+        if not link:
+            continue
+            
+        # 1. Проверка по базе данных (уже получал награду)
+        if await grs_is_completed(user_id, link):
+            continue
+            
+        # 2. Проверка через Telegram API (уже подписан)
+        # Это предотвращает "халявные" деньги за каналы, на которые юзер и так подписан
+        if bot:
+            try:
+                # Пытаемся извлечь chat_id из ссылки (t.me/username)
+                chat_id = link.split("/")[-1].split("?")[0]
+                if not chat_id.startswith("@") and not chat_id.startswith("-"):
+                    chat_id = "@" + chat_id
+                
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+                if member.status in ("member", "administrator", "creator"):
+                    # Если пользователь уже в канале, помечаем как выполненное (без начисления), 
+                    # чтобы не показывать это задание.
+                    await grs_mark_completed(user_id, link)
+                    continue
+            except Exception:
+                pass # Если не удалось проверить, просто показываем
+
+        offers.append(o)
+
     if not offers:
         text = "🌿 *Grs задания*\n\n📝 Доступных заданий: 0\n───────────────\n💫 Можно заработать: 0$"
         return text, []
@@ -195,10 +224,13 @@ async def _build_tgrassa_content(
         name = (o.get("name") or o.get("title") or "Канал").strip() or "Канал"
         link = o.get("link") or o.get("url") or ""
         if link:
+            # Сохраняем каждое задание как ожидающее (pending)
+            price = _parse_price_usd(o) or 0.008 # Дефолтная цена если API не вернул
+            await tgrassa_save_pending(user_id, link, price)
             rows.append([InlineKeyboardButton(text=f"📢 {name[:30]}", url=link)])
+    
     rows.append([InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_tgrass")])
-    if total_payout > 0:
-        await grs_set_pending_credit(user_id, total_payout)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="platform:tgrassa")])
     return text, rows
 
 
@@ -208,7 +240,7 @@ async def show_tgrassa(callback: CallbackQuery) -> None:
     user = callback.from_user
     user_id = user.id if user else 0
     username = (user.username or "") if user else ""
-    text, rows = await _build_tgrassa_content(user_id, username, user)
+    text, rows = await _build_tgrassa_content(user_id, username, user, bot=callback.bot)
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
@@ -223,7 +255,7 @@ async def show_tgrassa_message(message: Message) -> None:
     user = message.from_user
     user_id = user.id if user else 0
     username = (user.username or "") if user else ""
-    text, rows = await _build_tgrassa_content(user_id, username, user)
+    text, rows = await _build_tgrassa_content(user_id, username, user, bot=message.bot)
     if rows:
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="Markdown")
     else:
@@ -232,12 +264,22 @@ async def show_tgrassa_message(message: Message) -> None:
 
 @router.callback_query(F.data == "check_tgrass")
 async def callback_check_tgrass(callback: CallbackQuery) -> None:
-    """Повторная проверка Tgrass: снова POST /offers. Если ok/no_offers — успех."""
+    """
+    Повторная проверка Tgrass: проверяем каждый оффер отдельно.
+    Если оффер пропал из списка API /offers и пользователь подписан (get_chat_member) — награждаем.
+    """
     user = callback.from_user
     user_id = user.id if user else 0
     username = (user.username or "") if user else ""
     if not config.TGRASSA_API_KEY:
         await callback.answer("API не настроен.", show_alert=True)
+        return
+
+    # 1. Получаем список ожидающих заданий из БД
+    pending_list = await tgrassa_get_pending_by_user(user_id)
+    if not pending_list:
+        await callback.answer("Нет заданий для проверки. Нажмите «Обновить».", show_alert=True)
+        await show_tgrassa(callback)
         return
 
     await callback.answer("Проверяю подписки…")
@@ -255,23 +297,54 @@ async def callback_check_tgrass(callback: CallbackQuery) -> None:
         await callback.bot.send_message(user_id, _alert(f"Ошибка: {err_msg}"))
         return
 
-    status = (data.get("status") or "").lower().strip()
-    if status in ("ok", "no_offers"):
-        amount = await grs_take_pending_amount(user_id)
-        if amount > 0:
-            unfreeze_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-            await frozen_add(user_id, amount, unfreeze_at, "grs")
-        await show_tgrassa(callback)
-        if amount > 0:
-            await callback.bot.send_message(
-                user_id,
-                f"✅ Проверка пройдена! Сумма {amount:.2f} заморожена на 24 ч. Если останетесь подписанным — будет зачислена на баланс.",
-            )
-        else:
-            await callback.bot.send_message(user_id, "✅ Проверка пройдена!")
-        return
+    # Офферы, которые Tgrass ВСЕ ЕЩЕ считает невыполненными
+    remaining_offers = data.get("offers") or []
+    remaining_links = {o.get("link") or o.get("url") for o in remaining_offers if (o.get("link") or o.get("url"))}
 
-    text, rows = await _build_tgrassa_content(user_id, username, user, data=data, randomize=False)
+    total_frozen = 0.0
+    n_completed = 0
+    unfreeze_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+    for p in pending_list:
+        link = p["signature"]
+        price = p["price"]
+
+        # Если ссылки нет в списке оставшихся — значит Tgrass считает ее выполненной
+        if link not in remaining_links:
+            # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: проверяем реально ли юзер в канале
+            is_member = False
+            try:
+                chat_id = link.split("/")[-1].split("?")[0]
+                if not chat_id.startswith("@") and not chat_id.startswith("-"):
+                    chat_id = "@" + chat_id
+                
+                member = await callback.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+                if member.status in ("member", "administrator", "creator"):
+                    is_member = True
+            except Exception:
+                # Если не удалось проверить (например, ссылка не на канал или бот не админ), 
+                # доверяем API Tgrass, но в идеале здесь должна быть подписка.
+                # Для безопасности, если не удалось проверить chat_id, можно считать True 
+                # или False в зависимости от политики. Оставим True для совместимости с ссылками-не-каналами.
+                if "t.me/" not in link:
+                    is_member = True
+                else:
+                    is_member = False # Если это t.me ссылка и мы не смогли проверить — лучше не рисковать? 
+                    # Но может быть приватная ссылка. Tgrass обычно дает публичные.
+                    # Поставим True если API Tgrass говорит что выполнено.
+                    is_member = True
+
+            if is_member:
+                # Помечаем как выполненное и замораживаем награду
+                await tgrassa_mark_completed_and_freeze(user_id, link, price, unfreeze_at)
+                total_frozen += price
+                n_completed += 1
+
+    if n_completed > 0:
+        await tgrassa_clear_pending_for_completed(user_id)
+
+    # Обновляем сообщение с заданиями
+    text, rows = await _build_tgrassa_content(user_id, username, user, bot=callback.bot, data=data)
     try:
         await callback.message.edit_text(
             text,
@@ -280,16 +353,20 @@ async def callback_check_tgrass(callback: CallbackQuery) -> None:
         )
     except Exception:
         pass
-    await callback.bot.send_message(
-        user_id,
-        "Подпишитесь на все каналы выше и нажмите «Проверить подписку» снова.",
-    )
+
+    if total_frozen > 0:
+        await callback.bot.send_message(
+            user_id,
+            f"✅ Проверка пройдена! Выполнено заданий: {n_completed}. Сумма {total_frozen:.3f}$ заморожена на 24 ч.",
+        )
+    else:
+        await callback.answer("⚠️ Новых подписок не обнаружено. Подпишитесь на каналы перед проверкой!", show_alert=True)
 
 
 # --- Flyer: единый формат заданий (Доступных заданий / Можно заработать $) ---
 
 
-async def _build_flyer_content(user_id: int, lang: str) -> tuple[str, list]:
+async def _build_flyer_content(user_id: int, lang: str, bot: Bot | None = None) -> tuple[str, list]:
     """
     Flyer: только get_tasks. Список заданий (подписи активны 48 ч). Проверка — по кнопке «Проверить подписку» через /check_task.
     """
@@ -326,12 +403,36 @@ async def _build_flyer_content(user_id: int, lang: str) -> tuple[str, list]:
         rows = [[InlineKeyboardButton(text="🔄 Обновить", callback_data="platform:flyer")]]
         return text, rows
 
-    # Скрываем задания, которые пользователь уже выполнил
+    # Скрываем задания, которые пользователь уже выполнил или на которые уже подписан
     result_left = []
     for t in result:
         sig = t.get("signature") or ""
         if sig and await flyer_already_completed(user_id, sig):
             continue
+            
+        # Проверка через Telegram API (если уже подписан — скрываем)
+        if bot:
+            link_url = t.get("link")
+            links = t.get("links") or []
+            if not link_url and links:
+                first = links[0]
+                link_url = first if isinstance(first, str) else (first.get("url") or first.get("link") if isinstance(first, dict) else None)
+            
+            if link_url and isinstance(link_url, str) and "t.me/" in link_url:
+                try:
+                    chat_id = link_url.split("/")[-1].split("?")[0]
+                    if not chat_id.startswith("@") and not chat_id.startswith("-"):
+                        chat_id = "@" + chat_id
+                    
+                    member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+                    if member.status in ("member", "administrator", "creator"):
+                        # Пользователь уже подписан, помечаем как выполненное (без начисления), чтобы скрыть
+                        from database import flyer_mark_completed_and_credit
+                        await flyer_mark_completed_and_credit(user_id, sig, 0.0)
+                        continue
+                except Exception:
+                    pass
+
         result_left.append(t)
 
     if not result_left:
@@ -382,7 +483,7 @@ async def show_flyer(callback: CallbackQuery, *, skip_answer: bool = False) -> N
     """Fly задания по callback (кнопка из инлайн-меню или Обновить). skip_answer=True если answer уже вызван (например из flyer_check)."""
     user_id = callback.from_user.id if callback.from_user else 0
     lang = _user_lang(callback.from_user)
-    text, rows = await _build_flyer_content(user_id, lang)
+    text, rows = await _build_flyer_content(user_id, lang, bot=callback.bot)
     try:
         if rows:
             await callback.message.edit_text(
@@ -404,7 +505,7 @@ async def show_flyer_message(message: Message) -> None:
     """Fly задания по нажатию кнопки нижнего меню."""
     user_id = message.from_user.id if message.from_user else 0
     lang = _user_lang(message.from_user)
-    text, rows = await _build_flyer_content(user_id, lang)
+    text, rows = await _build_flyer_content(user_id, lang, bot=message.bot)
     if rows:
         await message.answer(
             text,
@@ -480,32 +581,23 @@ async def callback_flyer_check(callback: CallbackQuery) -> None:
     await show_flyer(callback, skip_answer=True)
     chat_id = callback.message.chat.id if callback.message else callback.from_user.id
 
-    parts = []
-    if n_complete > 0 and total_frozen > 0:
-        parts.append(
-            f"✅ По {n_complete} заданию(ям) сумма {total_frozen:.2f} заморожена на 24 ч. "
-            "После проверки подписки будет зачислена на баланс."
+    if total_frozen > 0:
+        await callback.bot.send_message(
+            chat_id,
+            f"✅ Проверка пройдена! Сумма {total_frozen:.2f} заморожена на 24 ч. Если останетесь подписанным — будет зачислена на баланс.",
         )
-    if n_waiting > 0:
-        parts.append(
-            f"⏳ {n_waiting} заданий приняты. Окончательная проверка через 24 ч. "
-            "Оставайтесь подписанными — тогда сумма будет зачислена."
+    elif n_waiting > 0:
+        await callback.bot.send_message(
+            chat_id,
+            "⏳ Задание принято! Окончательная проверка через 24 ч. Оставайтесь подписанными — тогда сумма будет зачислена на баланс."
         )
-    if n_abort > 0:
-        parts.append(
+    elif n_abort > 0:
+        await callback.bot.send_message(
+            chat_id,
             f"❌ По {n_abort} заданию(ям) подписка отменена. Подпишитесь снова и нажмите «Проверить подписку»."
         )
-    if n_incomplete > 0 or n_error > 0:
-        if n_incomplete > 0 or (n_complete == 0 and n_waiting == 0 and n_abort == 0):
-            parts.append(
-                "Выполните подписку на каналы выше и нажмите «Проверить подписку». "
-                "Подписи заданий активны 48 ч с момента создания."
-            )
-    if n_error > 0:
-        parts.append(f"Ошибка при проверке заданий: {n_error}.")
-
-    msg = "\n\n".join(parts) if parts else "Проверка завершена. Обновите список заданий."
-    await callback.bot.send_message(chat_id, msg)
+    else:
+        await callback.answer("⚠️ Новых выполнений не найдено. Подпишитесь на каналы выше перед проверкой!", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("checkfly:"))
@@ -555,9 +647,9 @@ async def check_flyer_task(callback: CallbackQuery) -> None:
         payout = config.FLYER_PAYOUT_PER_TASK
         unfreeze_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
         await flyer_mark_completed_and_freeze(user_id, signature, payout, unfreeze_at)
-        await callback.answer(
-            f"✅ Сумма {payout:.2f} заморожена на 24 ч. Если останетесь подписанным — будет зачислена на баланс.",
-            show_alert=True,
+        await callback.bot.send_message(
+            user_id,
+            f"✅ Проверка пройдена! Сумма {payout:.2f} заморожена на 24 ч. Если останетесь подписанным — будет зачислена на баланс.",
         )
         await show_flyer(callback, skip_answer=True)
         return

@@ -30,12 +30,10 @@ async def _balance_text(balance: float, user_id: int) -> str:
     lines = [
         "💻 *Личный кабинет*",
         "━━━━━━━━━━━━━━━━━",
-        f"💰 Ваш баланс: *{balance:.2f}*",
+        f"💰 Ваш баланс: *{balance:.3f}$*",
     ]
     if frozen_total > 0:
-        lines.append(f"❄️ Заморожено: *{frozen_total:.2f}*")
-        if min_unfreeze:
-            lines.append(f"   _Разморозка: {_format_unfreeze_at(min_unfreeze)}_")
+        lines.append(f"❄️ Заморожено: *{frozen_total:.3f}$*")
     lines.append("")
     lines.append("Баланс можно вывести в Crypto Bot (кнопка «Вывод»).")
     lines.append("Замороженные средства зачислятся через 24 ч, если вы останетесь подписанным.")

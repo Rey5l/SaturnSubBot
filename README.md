@@ -47,9 +47,11 @@ Telegram-бот для заработка на заданиях (Tgrassa и Flye
 ## Запуск
 
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 python main.py
 ```
+
+**Перенос на сервер Windows:** пошаговая инструкция в [DEPLOY_WINDOWS.md](DEPLOY_WINDOWS.md).
 
 ## Админ-команды
 

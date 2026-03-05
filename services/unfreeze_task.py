@@ -30,24 +30,45 @@ async def _process_due(bot) -> None:
 
         try:
             if platform == "grs":
-                if not config.TGRASSA_API_KEY:
+                if not signature:
                     await frozen_delete(row_id)
                     continue
-                data = await tgrass_check(
-                    key=config.TGRASSA_API_KEY,
-                    tg_user_id=user_id,
-                    tg_login="",
-                    lang="ru",
-                    is_premium=False,
-                )
-                status = (data.get("status") or "").lower()
-                if status in ("ok", "no_offers"):
+                
+                # Строгая проверка подписки через Telegram API
+                is_member = False
+                try:
+                    chat_id = signature.split("/")[-1].split("?")[0]
+                    if not chat_id.startswith("@") and not chat_id.startswith("-"):
+                        chat_id = "@" + chat_id
+                    
+                    member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+                    if member.status in ("member", "administrator", "creator"):
+                        is_member = True
+                except Exception:
+                    # Если не удалось проверить через API (например, ссылка не на канал),
+                    # пробуем через API Tgrass
+                    if not config.TGRASSA_API_KEY:
+                        await frozen_delete(row_id)
+                        continue
+                    data = await tgrass_check(
+                        key=config.TGRASSA_API_KEY,
+                        tg_user_id=user_id,
+                        tg_login="",
+                        lang="ru",
+                        is_premium=False,
+                    )
+                    remaining_offers = data.get("offers") or []
+                    remaining_links = {o.get("link") or o.get("url") for o in remaining_offers if (o.get("link") or o.get("url"))}
+                    if signature not in remaining_links:
+                        is_member = True
+
+                if is_member:
                     result = await frozen_release_and_credit(row_id)
                     if result:
                         _, credited = result
                         await bot.send_message(
                             user_id,
-                            f"❄️ Разморозка: сумма *{credited:.2f}* зачислена на баланс. Спасибо, что остаётесь с нами!",
+                            f"❄️ Разморозка: сумма *{credited:.3f}$* зачислена на баланс за подписку на Tgrass. Спасибо!",
                             parse_mode="Markdown",
                         )
                 else:
